@@ -35,10 +35,10 @@ public:
                      bool reinit);
 
 
-    void trackPoints(const cv::Mat &prvFrame,
+    corr trackCorrespondance(const cv::Mat &prvFrame,
                      const cv::Mat &currentFrame,
-                     corr &prev_correspondance,
                      corr &current_correspondance,
+                     int totalFeatures,
                      bool reinit);
 
     struct comparator_cvPoint2f
@@ -48,8 +48,6 @@ public:
             return lhs.x < rhs.x;
         }
     };
-
-
 
 private:
     inline bool isFlowCorrect(cv::Point2f u);

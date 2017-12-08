@@ -262,10 +262,7 @@ cv::Rect2d denseOpticalFlowTracker::getReliablePoints(const cv::Mat & frame0,
         resultBB = predictBoundingBox(startPoints, trackedPoints, inpRect);
     }
     return resultBB;
-
-
 }
-
 
 void denseOpticalFlowTracker::trackPoints(const cv::Mat &f_prv,
                  const cv::Mat &f_curr,
@@ -329,7 +326,6 @@ void denseOpticalFlowTracker::trackPoints(const cv::Mat &f_prv,
                                   flowy_forward);
                 tempPrevious.insert(tempPrevious.end(), prvFramePoints.begin(), prvFramePoints.end());
                 tempCurrent.insert(tempCurrent.end(), currentFramePoints.begin(), currentFramePoints.end());
-
                 prvFramePoints = tempPrevious;
                 currentFramePoints = tempCurrent;
             }
@@ -368,14 +364,38 @@ void denseOpticalFlowTracker::trackPoints(const cv::Mat &f_prv,
             }
         }
     }
-
 }
 
-void denseOpticalFlowTracker::trackPoints(const cv::Mat &prvFrame,
+corr denseOpticalFlowTracker::trackCorrespondance(const cv::Mat &prvFrame,
                  const cv::Mat &currentFrame,
-                 corr &prev_correspondance,
-                 corr &current_correspondance,
-                 bool reinit)
+                 corr &previous_correspondance,
+                 int totalFeatures,
+                 bool reinit = false)
 {
 
+    // initialize the current frame references
+    corr currentFrameCorrespondance(previous_correspondance.frame_1+1, previous_correspondance.frame_2+1);
+    std::vector<cv::Point2f> startPoints = previous_correspondance.p1;
+    std::vector<cv::Point2f> trackedPoints = previous_correspondance.p2;
+    if(reinit && startPoints.empty())
+    {
+        trackPoints(prvFrame, currentFrame, startPoints, trackedPoints, reinit);
+        size_t sz = startPoints.size();
+        currentFrameCorrespondance.p1 = startPoints;
+        currentFrameCorrespondance.p2 = trackedPoints;
+        currentFrameCorrespondance.unique_id.resize(sz);
+        currentFrameCorrespondance.col.resize(sz);
+        for (int i = totalFeatures; i < totalFeatures + startPoints.size(); i++)
+        {
+            currentFrameCorrespondance.unique_id[i] = i;
+            currentFrameCorrespondance.col[i] = prvFrame.at<cv::Vec3b>(startPoints[i]);
+        }
+        CalculateDelta(currentFrameCorrespondance);
+    }
+    else
+    {
+        startPoints = trackedPoints;
+        trackPoints(prvFrame, currentFrame, startPoints, trackedPoints, reinit, /*send unique id along with the points*/);
+    }
+    return currentFrameCorrespondance;
 }

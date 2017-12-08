@@ -25,6 +25,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 # Find OpenCV and CERES
 find_package(OpenCV REQUIRED)
 find_package(Ceres REQUIRED)
+#find_package(gflags REQUIRED)
 
 # If the package has been found, several variables will
 # be set, you can find the full list with descriptions
@@ -70,4 +71,13 @@ add_library(matrix src/matrix.cpp)
 add_executable(trajectory_with_flow scripts/compute_trajactory.cpp)
 
 # Link your application with OpenCV libraries
-target_link_libraries(trajectory_with_flow ${OpenCV_LIBS})
+target_link_libraries(trajectory_with_flow ${OpenCV_LIBS}
+                                           gflags
+                                           glog
+                                           tiff
+                                           ${CERES_LIBRARIES}
+                                           helpers-cc
+                                           dense-optical_flow-tracker)
+
+
+
