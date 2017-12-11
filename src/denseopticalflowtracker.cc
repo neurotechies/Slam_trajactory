@@ -8,8 +8,8 @@ denseOpticalFlowTracker::denseOpticalFlowTracker(cv::Size sz, std::string m = "b
     farn = cv::cuda::FarnebackOpticalFlow::create();
     tvl1 = cv::cuda::OpticalFlowDual_TVL1::create();
 
-    d_flow_forward  = cv::cuda::GpuMat(sz, CV_32FC2);
-    d_flow_backward = cv::cuda::GpuMat(sz, CV_32FC2);
+    //forwardFlow  = cv::cuda::GpuMat(sz, CV_32FC2);
+    //backwardFlow = cv::cuda::GpuMat(sz, CV_32FC2);
 
 }
 
@@ -164,32 +164,211 @@ cv::Rect2d denseOpticalFlowTracker::predictBoundingBox(const std::vector<cv::Poi
 }
 
 
-cv::Rect2d denseOpticalFlowTracker::getReliablePoints(const cv::Mat & frame0,
-                         const cv::Mat & frame1,
-                         const cv::cuda::GpuMat & forwardFlow,
-                         const cv::cuda::GpuMat & backwardFlow,
-                         std::vector<cv::Point2f> &startPoints,
-                         std::vector<cv::Point2f> &trackedPoints,
-                         cv::Mat_<float> &flowx_forward,
-                         cv::Mat_<float> &flowy_forward,
-                         cv::Rect2d inpRect = cv::Rect2d())
+cv::Vec3b denseOpticalFlowTracker::computeColor(float fx, float fy)
 {
-    startPoints.clear();
-    trackedPoints.clear();
+    static bool first = true;
+
+    // relative lengths of color transitions:
+    // these are chosen based on perceptual similarity
+    // (e.g. one can distinguish more shades between red and yellow
+    //  than between yellow and green)
+    const int RY = 15;
+    const int YG = 6;
+    const int GC = 4;
+    const int CB = 11;
+    const int BM = 13;
+    const int MR = 6;
+    const int NCOLS = RY + YG + GC + CB + BM + MR;
+    static cv::Vec3i colorWheel[NCOLS];
+
+    if (first)
+    {
+        int k = 0;
+
+        for (int i = 0; i < RY; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(255, 255 * i / RY, 0);
+
+        for (int i = 0; i < YG; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(255 - 255 * i / YG, 255, 0);
+
+        for (int i = 0; i < GC; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(0, 255, 255 * i / GC);
+
+        for (int i = 0; i < CB; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(0, 255 - 255 * i / CB, 255);
+
+        for (int i = 0; i < BM; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(255 * i / BM, 0, 255);
+
+        for (int i = 0; i < MR; ++i, ++k)
+            colorWheel[k] = cv::Vec3i(255, 0, 255 - 255 * i / MR);
+
+        first = false;
+    }
+
+    const float rad = sqrt(fx * fx + fy * fy);
+    const float a = atan2(-fy, -fx) / (float) CV_PI;
+
+    const float fk = (a + 1.0f) / 2.0f * (NCOLS - 1);
+    const int k0 = static_cast<int>(fk);
+    const int k1 = (k0 + 1) % NCOLS;
+    const float f = fk - k0;
+
+    cv::Vec3b pix;
+
+    for (int b = 0; b < 3; b++)
+    {
+        const float col0 = colorWheel[k0][b] / 255.0f;
+        const float col1 = colorWheel[k1][b] / 255.0f;
+
+        float col = (1 - f) * col0 + f * col1;
+
+        if (rad <= 1)
+            col = 1 - rad * (1 - col); // increase saturation with radius
+        else
+            col *= .75; // out of range
+
+        pix[2 - b] = static_cast<uchar>(255.0 * col);
+    }
+
+    return pix;
+}
+
+void denseOpticalFlowTracker::drawOpticalFlow(const cv::Mat_<float>& flowx, const cv::Mat_<float>& flowy, cv::Mat& dst, float maxmotion = -1)
+{
+    dst.create(flowx.size(), CV_8UC3);
+    dst.setTo(cv::Scalar::all(0));
+
+    // determine motion range:
+    float maxrad = maxmotion;
+
+    if (maxmotion <= 0)
+    {
+        maxrad = 1;
+        for (int y = 0; y < flowx.rows; ++y)
+        {
+            for (int x = 0; x < flowx.cols; ++x)
+            {
+                cv::Point2f u(flowx(y, x), flowy(y, x));
+
+                if (!isFlowCorrect(u))
+                    continue;
+
+                maxrad = std::max(maxrad, (float)sqrt(u.x * u.x + u.y * u.y));
+
+            }
+        }
+    }
+
+    for (int y = 0; y < flowx.rows; ++y)
+    {
+        for (int x = 0; x < flowx.cols; ++x)
+        {
+            cv::Point2f u(flowx(y, x), flowy(y, x));
+
+            if (isFlowCorrect(u))
+                dst.at<cv::Vec3b>(y, x) = computeColor(u.x / maxrad, u.y / maxrad);
+        }
+    }
+}
+
+
+
+void denseOpticalFlowTracker::showFlow(const char* name, const cv::cuda::GpuMat& d_flow)
+{
+    cv::cuda::GpuMat planes[2];
+    cv::cuda::split(d_flow, planes);
+
+    cv::Mat flowx(planes[0]);
+    cv::Mat flowy(planes[1]);
+
+    cv::Mat out;
+    drawOpticalFlow(flowx, flowy, out);
+
+    cv::imshow(name, out);
+}
+
+
+void denseOpticalFlowTracker::trackCorrespondance(const cv::Mat & frame0,
+                                                  const cv::Mat & frame1,
+                                                  const corr &previous_correspondance,
+                                                  corr &currentFrameCorrespondance,
+                                                  bool reinit,
+                                                  int &totalFeatures,
+                                                  cv::Rect2d inpRect,
+                                                  cv::Rect2d &resultBB)
+{
+    int featureCount = 0;
+    std::vector<cv::Point2f> resultStartPoints;
+    std::vector<cv::Point2f> resultTrackedPoints;
+    std::vector<int> resultUniqueID;
+    std::vector<cv::Vec3b> resultColours;
+    resultBB = cv::Rect2d();
+
+
+    currentFrameCorrespondance.frame_1 = previous_correspondance.frame_1+1;
+    currentFrameCorrespondance.frame_2 = previous_correspondance.frame_2+1;
+    std::vector<cv::Point2f> startPoints = previous_correspondance.p1;
+    std::vector<cv::Point2f> trackedPoints = previous_correspondance.p2;
+    std::vector<int> unique_id = previous_correspondance.unique_id;
+    std::vector<cv::Vec3b> colors = previous_correspondance.col;
+
+    assert(startPoints.size() == trackedPoints.size());
+    assert(trackedPoints.size() == unique_id.size());
+    assert(unique_id.size() == colors.size());
+
+    //    frame0.copyTo(prvFrame);
+    //    frame1.copyTo(currentFrame);
+    //prvFrame = frame0.clone();
+    //currentFrame = frame1.clone();
+    //if(prvFrame.channels() == 3)
+    //{
+    cvtColor(frame0, prvFrameGray, cv::COLOR_BGR2GRAY);
+    //}
+
+    //if(currentFrame.channels() == 3)
+    //{
+    cvtColor(frame1, currentFrameGray, cv::COLOR_BGR2GRAY);
+    //}
+
+    //cv::imshow("prvFrameGray", prvFrameGray);
+    //cv::imshow("currentFrameGray", currentFrameGray);
+    //cv::waitKey(0);
+
+
+    cv::cuda::GpuMat framegpu0(prvFrameGray);
+    cv::cuda::GpuMat framegpu1(currentFrameGray);
+
+    cv::cuda::GpuMat forwardFlow(prvFrameGray.size(), CV_32FC2);
+    cv::cuda::GpuMat backwardFlow(currentFrameGray.size(), CV_32FC2);
+
+    // convert the pixel range from 0-255(uint) to 0-1(float)
+    framegpu0.convertTo(framegpu0f, CV_32F, 1.0 / 255.0);
+    framegpu1.convertTo(framegpu1f, CV_32F, 1.0 / 255.0);
+
+    if(method == "brox")
+    {
+        tvl1->calc(framegpu0f, framegpu1f, forwardFlow);
+        tvl1->calc(framegpu1f, framegpu0f, backwardFlow);
+    }
+    showFlow("Brox", forwardFlow);
+
     cv::cuda::GpuMat planes[2];
     cv::cuda::split(forwardFlow, planes);
     cv::Mat tempx(planes[0]);
     cv::Mat tempy(planes[1]);
+
+    imshow("tempx", tempx);
+
     if(!inpRect.empty())
     {
         tempx = tempx(inpRect);
         tempy = tempy(inpRect);
     }
-
-    cv::Rect2d resultBB = cv::Rect2d();
     flowx_forward = tempx;
     flowy_forward = tempy;
 
+    //imshow("flowx_forward", flowx_forward);
     cv::cuda::split(backwardFlow, planes);
     cv::Mat tempx1(planes[0]);
     cv::Mat tempy1(planes[1]);
@@ -200,202 +379,184 @@ cv::Rect2d denseOpticalFlowTracker::getReliablePoints(const cv::Mat & frame0,
         tempy1 = tempy1(inpRect);
     }
 
+    flowx_backward = tempx1;
+    flowy_backward = tempy1;
 
-    cv::Mat_<float> flowx_backward = tempx1;
-    cv::Mat_<float> flowy_backward = tempy1;
-
-    cv::Size winSize(10,10);
+    cv::Size winSize(5,5);
     cv::Mat res_im, res_template, res_result;
-    cv::Mat_<float> crossCorrelationResult = cv::Mat_<float>(tempx.size(), (float)0);
-    cv::Mat_<float> euclidianCorrelationResult = cv::Mat_<float>(tempx.size(), (float)0);
 
-    // select points based on cross correlation
-    for (int y = 0; y < flowx_forward.rows; ++y)
+    if(startPoints.empty())
     {
-        for (int x = 0; x < flowx_forward.cols; ++x)
+        cv::Mat_<float> crossCorrelationResult = cv::Mat_<float>(tempx.size(), (float)0);
+        cv::Mat_<float> euclidianCorrelationResult = cv::Mat_<float>(tempx.size(), std::numeric_limits<float>::max());
+        // select points based on cross correlation
+        for (int y = 3; y < flowx_forward.rows - 3; ++y)
         {
-            cv::Point2f u(flowx_forward(y, x), flowy_forward(y, x));
-
-            if (!isFlowCorrect(u))
-                continue;
-            cv::getRectSubPix(frame0, winSize, cv::Point2f(y, x), res_im);
-            cv::getRectSubPix(frame1, winSize, cv::Point2f(y + u.y, x + u.x), res_template);
-            cv::matchTemplate(res_im, res_template, res_result, CV_TM_CCOEFF_NORMED);
-            cv::Mat_<float> temp = res_result;
-            crossCorrelationResult(y,x) = temp(0,0);
-        }
-    }
-
-    // select points based on euclidian distance
-    for (int y = 0; y < flowx_backward.rows; ++y)
-    {
-        for (int x = 0; x < flowx_backward.cols; ++x)
-        {
-            cv::Point2f u(flowx_backward(y, x), flowy_backward(y, x));
-            if (!isFlowCorrect(u))
-                continue;
-
-            float im2_x = x + flowx_forward(y, x);
-            float im2_y = y + flowy_forward(y, x);
-            float p1 =  u.x + im2_x;
-            float p2 =  u.y + im2_y;
-
-            euclidianCorrelationResult(y,x) = sqrt((p1 - x) * (p1 - x) + (p2 - y) * (p2 - y));
-        }
-    }
-    float medNCC = computeMedian(crossCorrelationResult);
-    float medFB = computeMedian(euclidianCorrelationResult);
-    for (int y = 0; y < crossCorrelationResult.rows; ++y)
-    {
-        for (int x = 0; x < crossCorrelationResult.cols; ++x)
-        {
-            if(crossCorrelationResult(y,x) >= medNCC && euclidianCorrelationResult(y,x) <= medFB)
+            for (int x = 3; x < flowx_forward.cols - 3; ++x)
             {
                 cv::Point2f u(flowx_forward(y, x), flowy_forward(y, x));
-                startPoints.push_back(cv::Point2f(x,y));
-                trackedPoints.push_back(cv::Point2f(x + u.x, y + u.y));
+
+                if (!isFlowCorrect(u))
+                    continue;
+                cv::getRectSubPix(frame0, winSize, cv::Point2f(y, x), res_im);
+                cv::getRectSubPix(frame1, winSize, cv::Point2f(y + u.y, x + u.x), res_template);
+                cv::matchTemplate(res_im, res_template, res_result, CV_TM_CCOEFF_NORMED);
+                cv::Mat_<float> temp = res_result;
+                crossCorrelationResult(y,x) = temp(0,0);
             }
         }
+        std::cout << "sum flow " << cv::sum(flowx_forward)[0] << std::endl;
+        // select points based on euclidian distance
+        for (int y = 0; y < flowx_backward.rows; ++y)
+        {
+            for (int x = 0; x < flowx_backward.cols; ++x)
+            {
+                cv::Point2f u(flowx_backward(y, x), flowy_backward(y, x));
+                if (!isFlowCorrect(u))
+                    continue;
+
+                float im2_x = x + flowx_forward(y, x);
+                float im2_y = y + flowy_forward(y, x);
+                float p1 =  u.x + im2_x;
+                float p2 =  u.y + im2_y;
+                float val = sqrt((p1 - x) * (p1 - x) + (p2 - y) * (p2 - y));
+                std::cout << "pixel val - " << val << std::endl;
+                euclidianCorrelationResult(y,x) = val;
+            }
+        }
+        float medNCC = computeMedian(crossCorrelationResult);
+        float medFB = computeMedian(euclidianCorrelationResult);
+        std::cout << "medFB " << medFB << std::endl;
+        for (int y = 0; y < crossCorrelationResult.rows; ++y)
+        {
+            for (int x = 0; x < crossCorrelationResult.cols; ++x)
+            {
+                if(/*crossCorrelationResult(y,x) >= medNCC &&*/ euclidianCorrelationResult(y,x) <= 0.1 /*medFB*/)
+                {
+                    cv::Point2f u(flowx_forward(y, x), flowy_forward(y, x));
+                    startPoints.push_back(cv::Point2f(x, y));
+                    trackedPoints.push_back(cv::Point2f(x + u.x, y + u.y));
+                    colors.push_back(frame0.at<cv::Vec3b>(cv::Point2f(x, y)));
+                    unique_id.push_back(totalFeatures+featureCount++);
+                }
+            }
+        }
+        totalFeatures = unique_id.size();
     }
+    else
+    {
+        std::vector<float> ccResult(startPoints.size(), 0);
+        std::vector<float> eucResult(startPoints.size(), std::numeric_limits<float>::max());
+
+        for(int i = 0; i < startPoints.size(); i++)
+        {
+            cv::Point2f u(flowx_forward(startPoints[i]), flowy_forward(startPoints[i]));
+            cv::Point2f u1(flowx_backward(startPoints[i]), flowy_backward(startPoints[i]));
+
+            if (!isFlowCorrect(u))
+                continue;
+            cv::getRectSubPix(frame0, winSize, cv::Point2f(startPoints[i].y, startPoints[i].x), res_im);
+            cv::getRectSubPix(frame1, winSize, cv::Point2f(startPoints[i].y + u.y, startPoints[i].x + u.x), res_template);
+            cv::matchTemplate(res_im, res_template, res_result, CV_TM_CCOEFF_NORMED);
+            cv::Mat_<float> temp = res_result;
+            ccResult[i] = temp(0,0);
+
+
+            float im2_x = startPoints[i].x + flowx_forward(startPoints[i]);
+            float im2_y = startPoints[i].y + flowy_forward(startPoints[i]);
+            float p1 =  u1.x + im2_x;
+            float p2 =  u1.y + im2_y;
+
+            eucResult[i] = sqrt((p1 - startPoints[i].x) * (p1 - startPoints[i].x) + (p2 - startPoints[i].y) * (p2 - startPoints[i].y));
+        }
+        float medNCC = computeMedian(ccResult);
+        float medFB = computeMedian(eucResult);
+
+        for(int i = 0; i < startPoints.size(); i++)
+        {
+            if(/*ccResult[i] >= medNCC &&*/ eucResult[i] <= 0.1/*medFB*/)
+            {
+                cv::Point2f u(flowx_forward(startPoints[i]), flowy_forward(startPoints[i]));
+                resultStartPoints.push_back(startPoints[i]);
+                resultTrackedPoints.push_back(cv::Point2f(startPoints[i].x + u.x, startPoints[i].y + u.y));
+                resultColours.push_back(frame0.at<cv::Vec3b>(startPoints[i]));
+                resultUniqueID.push_back(unique_id[i]);
+            }
+        }
+
+        startPoints = resultStartPoints;
+        trackedPoints = resultTrackedPoints;
+        unique_id = resultUniqueID;
+        colors = resultColours;
+
+        if(reinit)
+        {
+            cv::Mat_<float> crossCorrelationResult = cv::Mat_<float>(tempx.size(), (float)0);
+            cv::Mat_<float> euclidianCorrelationResult = cv::Mat_<float>(tempx.size(), (float)0);
+            // select points based on cross correlation
+            for (int y = 0; y < flowx_forward.rows; ++y)
+            {
+                for (int x = 0; x < flowx_forward.cols; ++x)
+                {
+                    cv::Point2f u(flowx_forward(y, x), flowy_forward(y, x));
+
+
+                    if (!isFlowCorrect(u))
+                        continue;
+                    cv::getRectSubPix(frame0, winSize, cv::Point2f(y, x), res_im);
+                    cv::getRectSubPix(frame1, winSize, cv::Point2f(y + u.y, x + u.x), res_template);
+                    cv::matchTemplate(res_im, res_template, res_result, CV_TM_CCOEFF_NORMED);
+                    cv::Mat_<float> temp = res_result;
+                    crossCorrelationResult(y,x) = temp(0,0);
+                }
+            }
+
+            // select points based on euclidian distance
+            for (int y = 0; y < flowx_backward.rows; ++y)
+            {
+                for (int x = 0; x < flowx_backward.cols; ++x)
+                {
+                    cv::Point2f u(flowx_backward(y, x), flowy_backward(y, x));
+                    if (!isFlowCorrect(u))
+                        continue;
+
+                    float im2_x = x + flowx_forward(y, x);
+                    float im2_y = y + flowy_forward(y, x);
+                    float p1 =  u.x + im2_x;
+                    float p2 =  u.y + im2_y;
+
+                    euclidianCorrelationResult(y,x) = sqrt((p1 - x) * (p1 - x) + (p2 - y) * (p2 - y));
+                }
+            }
+            //float medNCC = computeMedian(crossCorrelationResult);
+            //float medFB = computeMedian(euclidianCorrelationResult);
+
+            for (int y = 0; y < crossCorrelationResult.rows; ++y)
+            {
+                for (int x = 0; x < crossCorrelationResult.cols; ++x)
+                {
+                    if(/*crossCorrelationResult(y,x) >= medNCC &&*/ euclidianCorrelationResult(y,x) <= 0.1/*medFB*/)
+                    {
+                        cv::Point2f u(flowx_forward(y, x), flowy_forward(y, x));
+                        startPoints.push_back(cv::Point2f(x, y));
+                        trackedPoints.push_back(cv::Point2f(x + u.x, y + u.y));
+                        unique_id.push_back(totalFeatures+featureCount++);
+                        colors.push_back(frame0.at<cv::Vec3b>(cv::Point2f(x, y)));
+                    }
+                }
+            }
+            totalFeatures += featureCount;
+        }
+    }
+
+    currentFrameCorrespondance.col = colors;
+    currentFrameCorrespondance.p1 = startPoints;
+    currentFrameCorrespondance.p2 = trackedPoints;
+    currentFrameCorrespondance.unique_id = unique_id;
+
+
     if(!inpRect.empty())
     {
         resultBB = predictBoundingBox(startPoints, trackedPoints, inpRect);
     }
-    return resultBB;
-}
-
-void denseOpticalFlowTracker::trackPoints(const cv::Mat &f_prv,
-                 const cv::Mat &f_curr,
-                 std::vector<cv::Point2f> &prvFramePoints,
-                 std::vector<cv::Point2f> &currentFramePoints,
-                 bool reinit = false)
-{
-    f_prv.copyTo(prvFrame);
-    f_curr.copyTo(currentFrame);
-    if(prvFrame.channels() == 3)
-    {
-        cvtColor(prvFrame, prvFrame, cv::COLOR_BGR2GRAY);
-    }
-
-    if(currentFrame.channels() == 3)
-    {
-        cvtColor(currentFrame, currentFrame, cv::COLOR_BGR2GRAY);
-    }
-
-    cv::cuda::GpuMat frame0(prvFrame);
-    cv::cuda::GpuMat frame1(currentFrame);
-
-    // convert the pixel range from 0-255(uint) to 0-1(float)
-    frame0.convertTo(frame0, CV_32F, 1.0 / 255.0);
-    frame1.convertTo(frame1, CV_32F, 1.0 / 255.0);
-
-    if(method == "brox")
-    {
-        brox->calc(frame0, frame1, d_flow_forward);
-        brox->calc(frame1, frame0, d_flow_backward);
-
-        if(prvFramePoints.empty() || reinit)
-        {
-            // compute the dense optical flow on the whole image
-            if(prvFramePoints.empty())
-            {
-                prvFramePoints.clear();
-                currentFramePoints.clear();
-                cv::Mat_<float> flowx_forward, flowy_forward;
-                getReliablePoints(prvFrame,
-                                  currentFrame,
-                                  d_flow_forward,
-                                  d_flow_backward,
-                                  prvFramePoints,
-                                  currentFramePoints,
-                                  flowx_forward,
-                                  flowy_forward);
-            }
-            else if(reinit)
-            {
-                std::vector<cv::Point2f> tempPrevious = prvFramePoints;
-                std::vector<cv::Point2f> tempCurrent  =  currentFramePoints;
-                cv::Mat_<float> flowx_forward, flowy_forward;
-                getReliablePoints(prvFrame,
-                                  currentFrame,
-                                  d_flow_forward,
-                                  d_flow_backward,
-                                  prvFramePoints,
-                                  currentFramePoints,
-                                  flowx_forward,
-                                  flowy_forward);
-                tempPrevious.insert(tempPrevious.end(), prvFramePoints.begin(), prvFramePoints.end());
-                tempCurrent.insert(tempCurrent.end(), currentFramePoints.begin(), currentFramePoints.end());
-                prvFramePoints = tempPrevious;
-                currentFramePoints = tempCurrent;
-            }
-        }
-        else
-        {
-            // track the points in the next frame
-            std::vector<cv::Point2f> tempPrevious;
-            std::vector<cv::Point2f> tempCurrent;
-            std::vector<cv::Point2f> resultPreviousPoints;
-
-            getReliablePoints(prvFrame,
-                              currentFrame,
-                              d_flow_forward,
-                              d_flow_backward,
-                              tempPrevious,
-                              tempCurrent,
-                              flowx_forward,
-                              flowy_forward);
-            // find the intersection of prvFramePoints with the tempPrevious
-            std::sort (tempPrevious.begin(), tempPrevious.end(), comparator_cvPoint2f{});
-            std::sort (prvFramePoints.begin(), prvFramePoints.end(), comparator_cvPoint2f{});
-
-            std::set_intersection(tempPrevious.begin(), tempPrevious.end(),
-                                  prvFramePoints.begin(), prvFramePoints.end(),
-                                  std::back_inserter(resultPreviousPoints),
-                                  comparator_cvPoint2f{});
-            prvFramePoints.clear();
-            currentFramePoints.clear();
-            for(int i = 0; i < resultPreviousPoints.size(); i++)
-            {
-                cv::Point2f pt = resultPreviousPoints[i];
-                cv::Point2f u(flowx_forward(pt), flowy_forward(pt));
-                prvFramePoints.push_back(cv::Point2f(pt.x, pt.y));
-                currentFramePoints.push_back(cv::Point2f(pt.x + u.x, pt.y + u.y));
-            }
-        }
-    }
-}
-
-corr denseOpticalFlowTracker::trackCorrespondance(const cv::Mat &prvFrame,
-                 const cv::Mat &currentFrame,
-                 corr &previous_correspondance,
-                 int totalFeatures,
-                 bool reinit = false)
-{
-
-    // initialize the current frame references
-    corr currentFrameCorrespondance(previous_correspondance.frame_1+1, previous_correspondance.frame_2+1);
-    std::vector<cv::Point2f> startPoints = previous_correspondance.p1;
-    std::vector<cv::Point2f> trackedPoints = previous_correspondance.p2;
-    if(reinit && startPoints.empty())
-    {
-        trackPoints(prvFrame, currentFrame, startPoints, trackedPoints, reinit);
-        size_t sz = startPoints.size();
-        currentFrameCorrespondance.p1 = startPoints;
-        currentFrameCorrespondance.p2 = trackedPoints;
-        currentFrameCorrespondance.unique_id.resize(sz);
-        currentFrameCorrespondance.col.resize(sz);
-        for (int i = totalFeatures; i < totalFeatures + startPoints.size(); i++)
-        {
-            currentFrameCorrespondance.unique_id[i] = i;
-            currentFrameCorrespondance.col[i] = prvFrame.at<cv::Vec3b>(startPoints[i]);
-        }
-        CalculateDelta(currentFrameCorrespondance);
-    }
-    else
-    {
-        startPoints = trackedPoints;
-        trackPoints(prvFrame, currentFrame, startPoints, trackedPoints, reinit, /*send unique id along with the points*/);
-    }
-    return currentFrameCorrespondance;
 }
